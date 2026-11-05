@@ -92,6 +92,131 @@ _MAP_PALETTE = (
     ('M', 'pink', (220, 110, 160)),
 )
 
+# Reward-relevant objects, matched by substrate prefix. Each entry maps the
+# palette letter of the object to a human-readable label. Colours are measured
+# at pixel level (not block-majority), so small apples survive the coarse map.
+_TARGET_OBJECTS = {
+    'commons_harvest': (('R', 'red apples (reward)'),),
+    'clean_up': (('R', 'red apples (reward)'),),
+    'allelopathic_harvest': (('R', 'red apples (reward)'),),
+    'planting_trees': (('R', 'ripe red fruit (reward)'),),
+    'fruit_market': (('R', 'red apples (reward)'),
+                     ('Y', 'yellow bananas (reward)')),
+    'coins': (('R', 'red coins'), ('M', 'pink coins'),
+              ('B', 'blue coins'), ('Y', 'yellow coins'),
+              ('G', 'green coins'), ('P', 'purple coins')),
+}
+
+# Palette letters that usually denote interactive objects rather than terrain.
+# Used for substrates without an explicit entry in `_TARGET_OBJECTS`.
+_GENERIC_OBJECT_LETTERS = frozenset(
+    ('R', 'O', 'Y', 'C', 'B', 'P', 'M', 'N', 'b'))
+
+# Eight compass sectors of the local view. 0 is straight ahead (top of view).
+_SECTOR_NAMES = (
+    'ahead', 'ahead-right', 'right', 'behind-right',
+    'behind', 'behind-left', 'left', 'ahead-left',
+)
+
+# Maps a target direction to the action sequence that approaches it.
+_SECTOR_ADVICE = {
+    'ahead': 'step forward now',
+    'ahead-left': 'turn left, then step forward',
+    'left': 'turn left, then step forward',
+    'behind-left': 'turn left, then step forward',
+    'ahead-right': 'turn right, then step forward',
+    'right': 'turn right, then step forward',
+    'behind-right': 'turn right, then step forward',
+    'behind': 'turn around (two turns), then step forward',
+}
+
+_TARGET_HEADERS = {
+    'en': '[Targets near you]',
+    'ja': '[近くの目標物]',
+}
+
+# Describes how to read the egocentric local view (bottom-centre = you).
+_VIEW_GUIDES = {
+    'en': (
+        'How to read the view:\n'
+        '- The bottom-centre sprite is YOU. Up is straight ahead of you, left '
+        'and right in the map match your left and right, and the bottom is '
+        'behind you.\n'
+        '- The view rotates with you: after turning, re-read the map.\n'
+        '- "step forward" moves you toward the top of the map. The target '
+        'summary below says where reward objects are: if a target is mostly '
+        'ahead, choose "step forward"; if it is mostly left or right, turn '
+        'that way first.\n'
+        '- When the target summary recommends a specific action number, '
+        'choose that action next; it already accounts for your facing.'
+    ),
+    'ja': (
+        '視点の読み方:\n'
+        '- 地図の下中央のスプライトがあなたです。上は正面、左右はあなたの'
+        '左右に対応し、下は後方です。\n'
+        '- 視点はあなたの向きと一緒に回転します。向きを変えたら地図を'
+        '読み直してください。\n'
+        '- 「step forward」は地図の上方向へ進みます。下の目標物の要約に、'
+        '報酬につながる物の方向が書かれています。目標が主に正面にあるなら'
+        '「step forward」、主に左右にあるならその方向へ向いてください。\n'
+        '- 目標物の要約が具体的な行動番号を勧めている場合は、その行動を'
+        '選んでください。あなたの向きはすでに考慮されています。'
+    ),
+}
+
+# Appended to the system prompt of every agent.
+_ANTI_STALL_GUIDE = {
+    'en': (
+        'Never choose "do nothing" for several steps in a row. If the target '
+        'summary says a target is mostly ahead, keep choosing "step forward"; '
+        'do not turn away from it. Turn only when the target is mostly to '
+        'your side or behind you. If no target is visible, follow the target '
+        'summary and turn to scan.'
+    ),
+    'ja': (
+        '「何もしない」を何ステップも続けないでください。目標物の要約が'
+        '「正面」と示しているなら「step forward」を選び続けてください。'
+        '目標が左右や後方にあるときだけ向きを変えてください。'
+        '目標が見えない場合は、目標物の要約の指示に従って向きを変えて'
+        '探索してください。'
+    ),
+}
+
+_PROGRESS_LINES = {
+    'en': ('[Progress] Total reward so far: {total:+.2f}. '
+           'Consecutive steps without reward: {streak}.'),
+    'ja': ('[進捗] これまでの合計報酬: {total:+.2f}. '
+           '報酬なしが続いているステップ数: {streak}.'),
+}
+
+_STALL_HINTS = {
+    'en': (
+        'Your recent actions are not earning reward. Change strategy now: '
+        'turn to scan, then step toward a target; do not choose "do nothing" '
+        'again.'
+    ),
+    'ja': (
+        '直近の行動では報酬が得られていません。今すぐ戦略を変えてください: '
+        '向きを変えて周囲を確認し、目標物に向かって進んでください。'
+        '「何もしない」を続けないでください。'
+    ),
+}
+
+# Shown when reward is still zero but the agent is already moving and trying
+# different actions, so the model is not pushed to abandon a good approach.
+_KEEP_GOING_HINTS = {
+    'en': (
+        'No reward yet, but you are moving. Follow the recommended next '
+        'action in the target summary; do not turn away from a visible '
+        'target.'
+    ),
+    'ja': (
+        'まだ報酬はありませんが、行動はできています。目標物の要約に表示された'
+        '推奨行動に従ってください。見えている目標から離れる方向へ向きを'
+        '変えないでください。'
+    ),
+}
+
 # Gameplay notes for well-known substrates (matched by prefix). Substrates not
 # listed fall back to a generic description.
 _SUBSTRATE_NOTES = {
@@ -101,17 +226,40 @@ _SUBSTRATE_NOTES = {
         'if every agent over-harvests, the commons collapse and nobody earns '
         'anything for the rest of the episode.',
     'clean_up':
-        'You gain reward by catching fish from a river; the river stays '
-        'polluted unless distant agents spend effort cleansing it. Agents can '
-        'also zap each other. Sustainable harvesting pays off long term.',
+        'You gain reward by walking onto and eating red apples in the orchard. '
+        'Apples regrow only while the nearby river is clean: the river gets '
+        'dirtier every step, so face the river and use the cleaning-beam '
+        'action to reduce pollution. Zapping other agents does not earn '
+        'reward. Sustainable harvesting pays off long term.',
     'in_the_matrix':
-        'This is a stylised prisoner\'s dilemma: you and the agent facing you '
-        'jointly reveal cooperation or betrayal every step. Mutual '
-        'cooperation yields a steady reward, while a betrayer can exploit a '
-        'cooperator.',
+        'This is a matrix game played face-to-face with the agent in front of '
+        'you. Walk up to your partner and use the interact action to play a '
+        'round; the payoff depends on both choices. Mutual cooperation '
+        'usually pays best over the episode.',
+    'prisoners_dilemma':
+        'This is a prisoner\'s dilemma played face-to-face with the agent in '
+        'front of you. Walk up to your partner and use the interact action to '
+        'play a round. Mutual cooperation yields a steady reward, while a '
+        'betrayer can exploit a cooperator.',
+    'stag_hunt':
+        'Walk up to another agent and use the interact action to choose Stag '
+        '(a large reward if both choose Stag) or Hare (a smaller, safer '
+        'reward). Agreeing on Stag pays best.',
+    'chicken':
+        'Walk up to another agent and use the interact action to choose Dare '
+        'or Chicken. Mutual Chicken is safe; mutual Dare crashes and pays '
+        'badly.',
+    'bach_or_stravinsky':
+        'Walk up to another agent and use the interact action to choose Bach '
+        'or Stravinsky. Matching your partner\'s choice rewards both of you.',
+    'rationalizable_coordination':
+        'Walk up to another agent and use the interact action to coordinate '
+        'on the same choice; matching pays both of you.',
     'predator_prey':
-        'Predators gain reward by zapping the prey players; prey players '
-        'should evade them.',
+        'Prey players gain reward by eating apples (1 reward) and acorns '
+        '(18 reward, but eating takes several steps and you cannot move). '
+        'Predators gain reward by eating prey. Prey are safer in groups; '
+        'avoid standing still in the open when a predator is near.',
     'running_with_scissors':
         'Agents pair up for repeated rock-paper-scissors rounds; the losing '
         'agents may receive a zap.',
@@ -162,7 +310,8 @@ _GENERIC_NOTE = (
     'motives and may cooperate or interfere with you.'
 )
 
-# Placeholders: {persona} {substrate} {note} {action_list} {max_action}.
+# Placeholders: {persona} {substrate} {note} {view_guide} {anti_stall}
+# {action_list} {max_action}.
 _SYSTEM_PROMPTS = {
     'en': (
         'You are {persona}, an autonomous agent in the multi-agent gridworld '
@@ -170,6 +319,8 @@ _SYSTEM_PROMPTS = {
         'The game: {note}\n\n'
         'Each step you observe a coarse top-down map of your immediate '
         'surroundings and choose exactly one action.\n\n'
+        '{view_guide}\n\n'
+        '{anti_stall}\n\n'
         'Available actions:\n{action_list}\n\n'
         'Your goal is to maximise the reward YOU receive, step after step.\n'
         'Answer with a single line of the form "ACTION: <number>" where '
@@ -183,6 +334,8 @@ _SYSTEM_PROMPTS = {
         'ゲームの概要: {note}\n\n'
         '毎ステップ、周囲の大まかな地図 (ASCII) を受け取り、ちょうど1つの'
         '行動を選択します。\n\n'
+        '{view_guide}\n\n'
+        '{anti_stall}\n\n'
         '選択できる行動:\n{action_list}\n\n'
         'あなたの目標は、自分が受け取る報酬を (合計で) 最大化することです。\n'
         '回答は必ず1行の「ACTION: <番号>」という形式で返してください。番号は '
@@ -191,13 +344,14 @@ _SYSTEM_PROMPTS = {
     ),
 }
 
-# Placeholders: {map} {map_legend} {scalar_observations} {history}
-# {max_action}.
+# Placeholders: {map} {map_legend} {targets} {progress}
+# {scalar_observations} {history} {max_action}.
 _USER_PROMPTS = {
     'en': (
         '[Your local view]\n'
         'A coarse colour map of what is around you right now (you are one of '
         'the coloured avatars):\n{map}\n\n{map_legend}\n\n'
+        '{targets}\n\n{progress}\n\n'
         '{scalar_observations}\n{history}\n'
         'Now decide your next action (0-{max_action}):\n'
         'ACTION: '
@@ -205,7 +359,9 @@ _USER_PROMPTS = {
     'ja': (
         '[あなたの周辺の様子]\n'
         'いま見えている大まかな色マップ (このうちの1つのアバターがあなた):\n'
-        '{map}\n\n{map_legend}\n\n{scalar_observations}\n{history}\n'
+        '{map}\n\n{map_legend}\n\n'
+        '{targets}\n\n{progress}\n\n'
+        '{scalar_observations}\n{history}\n'
         '次の1行動を決定してください (0-{max_action}):\nACTION: '
     ),
 }
@@ -340,6 +496,243 @@ def _bitmap_legend() -> str:
       if name not in ('void', 'dark grey', 'light grey'))
 
 
+def _target_specs(substrate_name: str) -> tuple[tuple[str, str], ...]:
+  """Returns the reward-object colour letters for a substrate."""
+  for key, specs in _TARGET_OBJECTS.items():
+    if substrate_name.startswith(key):
+      return specs
+  return ()
+
+
+def _summarise_targets(rgb: np.ndarray,
+                       substrate_name: str,
+                       prompt_language: str = 'en',
+                       action_names: Sequence[str] = (),
+                       last_action_name: str = '') -> str:
+  """Summarises where reward-relevant pixels are, relative to the agent.
+
+  The local RGB view is egocentric: the player is near the bottom centre and
+  the top of the image is straight ahead. This pixel-level summary keeps small
+  objects (such as apples) that the coarse block map may average away.
+  Connected components are used so the direction of the largest patch stays
+  stable as the view rotates.
+
+  Args:
+    rgb: uint8 array of shape (height, width, 3).
+    substrate_name: Used to pick the reward-object colours.
+    prompt_language: Language of the block header.
+    action_names: Action descriptions, used to recommend a concrete action
+      number (e.g. "ACTION 5 (turn left)").
+    last_action_name: Description of the previous action, used to alternate
+      cleaning and searching in clean_up.
+
+  Returns:
+    A short multi-line summary, or an empty string if no targets are known.
+  """
+  rgb = np.asarray(rgb)
+  if rgb.ndim != 3 or rgb.shape[2] < 3:
+    return ''
+  indices = _palette_indices(rgb)
+  chars = np.array([entry[0] for entry in _MAP_PALETTE])
+  letters = chars[indices]
+  height, width = letters.shape
+  anchor_y = height * 0.885
+  anchor_x = width * 0.5
+  cell_px = max(1.0, height / 11.0)
+
+  specs = _target_specs(substrate_name)
+  if not specs:
+    present = [
+        (int(np.count_nonzero(letters == letter)), letter, name)
+        for letter, name, _ in _MAP_PALETTE
+        if letter in _GENERIC_OBJECT_LETTERS and np.any(letters == letter)
+    ]
+    present.sort(reverse=True)
+    specs = tuple((letter, f'{name} objects')
+                  for _, letter, name in present[:4])
+  if not specs:
+    return ''
+
+  lines = []
+  visible = False
+  for letter, label in specs:
+    mask = letters == letter
+    count = int(np.count_nonzero(mask))
+    if count == 0:
+      lines.append(f'- {label}: not visible')
+      continue
+    visible = True
+    large = _largest_patch(mask, anchor_y, anchor_x, cell_px)
+    if large is None:
+      lines.append(f'- {label}: {count} px, direction unclear')
+    else:
+      sector, distance = large
+      recommendation = _recommended_action(sector, action_names)
+      lines.append(
+          f'- {label}: {count} px, largest patch {sector} '
+          f'(~{max(1, distance)} cells away); recommended next action: '
+          f'{recommendation}')
+  if not visible:
+    clean = _find_action(action_names, 'clean')
+    if clean is not None and substrate_name.startswith('clean_up'):
+      river = (letters == 'B') | (letters == 'C')
+      if np.any(river[:height // 2]):
+        if 'clean' in last_action_name.lower():
+          scan = (_find_action(action_names, 'turn right') or
+                  _find_action(action_names, 'turn left'))
+          if scan is not None:
+            lines.append(
+                f'- You just cleaned the river. Now use ACTION {scan} '
+                f'(turn to look for apples in the orchard).')
+        else:
+          lines.append(
+              f'- The blue river is ahead and no apples are visible. Use '
+              f'ACTION {clean} (fire the cleaning beam) so apples can regrow.')
+        return _TARGET_HEADERS[prompt_language] + '\n' + '\n'.join(lines)
+    scan = (_find_action(action_names, 'turn right') or
+            _find_action(action_names, 'turn left'))
+    if scan is not None:
+      lines.append(
+          f'- No reward target is visible. Recommended next action: '
+          f'ACTION {scan} (turn to scan for targets), then step forward.')
+  return _TARGET_HEADERS[prompt_language] + '\n' + '\n'.join(lines)
+
+
+def _find_action(action_names: Sequence[str], *phrases: str) -> int | None:
+  """Returns the first action index whose description contains a phrase."""
+  for index, name in enumerate(action_names):
+    lowered = name.lower()
+    if any(phrase in lowered for phrase in phrases):
+      return index
+  return None
+
+
+def _recommended_action(sector: str, action_names: Sequence[str]) -> str:
+  """Turns a target sector into a concrete next action recommendation."""
+  if not action_names:
+    return _SECTOR_ADVICE[sector]
+  forward = _find_action(
+      action_names, 'step forward', 'move forward', 'row the boat',
+      'row forward')
+  turn_left = _find_action(action_names, 'turn left')
+  turn_right = _find_action(action_names, 'turn right')
+  if sector == 'ahead' and forward is not None:
+    return f'ACTION {forward} (step forward now)'
+  if sector in ('ahead-left', 'left', 'behind-left') and turn_left is not None:
+    return f'ACTION {turn_left} (turn left, then step forward)'
+  if (sector in ('ahead-right', 'right', 'behind-right')
+      and turn_right is not None):
+    return f'ACTION {turn_right} (turn right, then step forward)'
+  if sector == 'behind':
+    if turn_left is not None:
+      return (f'ACTION {turn_left} (turn left; repeat until the target is '
+              'ahead)')
+    if turn_right is not None:
+      return (f'ACTION {turn_right} (turn right; repeat until the target is '
+              'ahead)')
+  return _SECTOR_ADVICE[sector]
+
+
+def _patch_sector(cx: float, cy: float, anchor_y: float,
+                  anchor_x: float) -> str:
+  """Returns the view sector of a point relative to the agent."""
+  angle = np.arctan2(cx - anchor_x, -(cy - anchor_y))
+  sector = int(np.round(angle / (np.pi / 4))) % 8
+  return _SECTOR_NAMES[sector]
+
+
+def _largest_patch(mask: np.ndarray, anchor_y: float, anchor_x: float,
+                   cell_px: float) -> tuple[str, int]:
+  """Returns (sector, distance in cells) of the largest patch."""
+  try:
+    import cv2  # pylint: disable=import-outside-toplevel
+  except ImportError:  # pragma: no cover - OpenCV is a declared dependency.
+    cv2 = None
+  if cv2 is not None:
+    num, _, stats, centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8)
+    best_label = None
+    for label in range(1, num):
+      if stats[label, cv2.CC_STAT_AREA] < 6:
+        continue
+      if best_label is None or (stats[label, cv2.CC_STAT_AREA] >
+                                stats[best_label, cv2.CC_STAT_AREA]):
+        best_label = label
+    if best_label is not None:
+      cx, cy = centroids[best_label]
+      return _patch_sector(cx, cy, anchor_y, anchor_x), int(
+          round(np.hypot(cx - anchor_x, cy - anchor_y) / cell_px))
+  ys, xs = np.nonzero(mask)
+  if len(xs) == 0:
+    return 'ahead', 0
+  return _patch_sector(float(xs.mean()), float(ys.mean()), anchor_y,
+                       anchor_x), 0
+
+
+def _zero_streak(memory: Sequence[tuple[int, str, float]]) -> int:
+  """Returns how many of the most recent actions earned no reward."""
+  streak = 0
+  for _, _, reward in reversed(memory):
+    if reward > 0:
+      break
+    streak += 1
+  return streak
+
+
+def _is_action_stall(memory: Sequence[tuple[int, str, float]]) -> bool:
+  """Returns True when the agent is standing still or spinning in place.
+
+  Two consecutive turns are allowed so the agent can scan 180 degrees; only
+  three turns in a row are treated as a stall.
+  """
+  if len(memory) < 2:
+    return False
+  if all(entry[0] == 0 for entry in memory[-2:]):
+    return True
+  if len(memory) < 3:
+    return False
+  recent = memory[-3:]
+  return (len({entry[0] for entry in recent}) == 1
+          and 'turn' in recent[-1][1].lower())
+
+
+def _progress_text(total_reward: float, streak: int,
+                   prompt_language: str, stalled: bool = False) -> str:
+  """Returns the progress line plus a nudge appropriate to the situation."""
+  text = _PROGRESS_LINES[prompt_language].format(
+      total=total_reward, streak=streak)
+  if stalled:
+    text += '\n' + _STALL_HINTS[prompt_language]
+  elif streak >= 2:
+    text += '\n' + _KEEP_GOING_HINTS[prompt_language]
+  return text
+
+
+def _build_exploration_pattern(
+    action_names: Sequence[str]) -> tuple[int, ...]:
+  """Returns movement actions used to break out of a no-reward stall."""
+  by_name = {}
+  for index, name in enumerate(action_names):
+    lowered = name.lower()
+    if 'step forward' in lowered:
+      by_name.setdefault('forward', index)
+    elif 'step backward' in lowered:
+      by_name.setdefault('backward', index)
+    elif 'turn left' in lowered:
+      by_name.setdefault('turn_left', index)
+    elif 'turn right' in lowered:
+      by_name.setdefault('turn_right', index)
+    elif 'sidestep left' in lowered:
+      by_name.setdefault('sidestep_left', index)
+    elif 'sidestep right' in lowered:
+      by_name.setdefault('sidestep_right', index)
+  order = (
+      'forward', 'forward', 'turn_right', 'forward', 'forward', 'turn_left',
+      'forward', 'turn_right', 'forward', 'sidestep_left', 'forward',
+      'sidestep_right')
+  return tuple(by_name[key] for key in order if key in by_name)
+
+
 def _strip_thinking(text: str) -> str:
   """Removes <think> sections from replies of
   reasoning-style models."""
@@ -387,7 +780,11 @@ class LLMAgentState:
   # Tuples of (action index, action name, reward), oldest first.
   memory: tuple[tuple[int, str, float], ...] = ()
   # Details of the most recent LLM decision, plus environment reward.
-  decision: Mapping[str, str | int | float] | None = None
+  decision: Mapping[str, object] | None = None
+  # Cumulative environment reward since the episode started.
+  total_reward: float = 0.0
+  # Position in the exploration pattern used to break out of stalls.
+  exploration_step: int = 0
 
 
 class OllamaPolicy(policy.Policy[LLMAgentState]):
@@ -409,6 +806,8 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
                num_predict: int = 128,
                request_timeout: float = DEFAULT_TIMEOUT,
                backend: str = 'auto',
+               exploration: bool = True,
+               stall_patience: int = 2,
                chat_fn=None,
                decision_fn=None,
                capabilities_fn=None):
@@ -433,6 +832,12 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
       backend: "auto" (default), "chat", or "decision". Decision models
         such as "tev1" and "nimble-v3" are detected automatically through
         Ollama's model capabilities and scored with `/v1/systemone`.
+      exploration: If True, replace repeated NOOP/same-action choices with a
+        short movement pattern once the agent has gone `stall_patience` steps
+        without reward. This prevents long episodes where the agent never
+        moves and the total reward stays at zero.
+      stall_patience: Number of consecutive zero-reward steps before the
+        exploration override may kick in.
       chat_fn: Optional standalone replacement of `ollama_client.chat`
         provided for testing only.
       decision_fn: Optional standalone replacement of
@@ -460,6 +865,9 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     self._persona = persona
     self._substrate_name = substrate_name
     self._prompt_language = prompt_language
+    self._exploration = bool(exploration)
+    self._stall_patience = max(1, int(stall_patience))
+    self._exploration_pattern = _build_exploration_pattern(self._action_names)
     self._system_prompt = _build_system_prompt(
         persona=persona,
         substrate_name=substrate_name,
@@ -509,22 +917,76 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     """Asks the LLM which discrete action to take next.
 
     On any transport or format failure the agent falls back to the NOOP
-    action (index 0) so a long multi-agent episode is never halted.
+    action (index 0) so a long multi-agent episode is never halted. When the
+    agent stalls (repeated NOOP or repeated turning with zero reward) an
+    exploration action is substituted so that it keeps moving and eventually
+    collects reward. Repeated forward movement is never overridden.
     """
     reward = float(np.asarray(timestep.reward).squeeze())
-    memory = (() if timestep.step_type.first() else prev_state.memory)
+    if timestep.step_type.first():
+      memory = ()
+      total_reward = 0.0
+      exploration_step = 0
+    else:
+      memory = prev_state.memory
+      total_reward = float(prev_state.total_reward) + reward
+      exploration_step = int(prev_state.exploration_step)
     if memory:
       # The reward in this timestep was earned by the previous action, so
       # attach it to the newest memory entry before prompting the model.
       last_index, last_name, _ = memory[-1]
       memory = memory[:-1] + ((last_index, last_name, reward),)
+
     if self._backend == 'decision':
-      return self._step_decision(timestep, memory, reward)
-    return self._step_chat(timestep, memory, reward)
+      index, decision = self._decide_decision(
+          timestep, memory, total_reward)
+    else:
+      index, decision = self._decide_chat(timestep, memory, total_reward)
+
+    index, exploration_step, explored = self._maybe_explore(
+        index, memory, reward, exploration_step)
+    if explored:
+      existing = decision.get('note')
+      decision['exploration'] = True
+      decision['note'] = (
+          f'{existing}; stalled: exploration override'
+          if existing else 'stalled: exploration override')
+
+    return self._finish_step(
+        index, memory, reward, decision,
+        total_reward=total_reward, exploration_step=exploration_step)
+
+  def _maybe_explore(self, index: int, memory, reward: float,
+                     exploration_step: int) -> tuple[int, int, bool]:
+    """Overrides a stalled NOOP/repeat choice with a movement action."""
+    exploration_step = int(exploration_step)
+    if not self._exploration or not self._exploration_pattern:
+      return index, exploration_step, False
+    if reward > 0:
+      return index, 0, False
+    if _zero_streak(memory) < self._stall_patience:
+      return index, exploration_step, False
+    last_index = memory[-1][0] if memory else None
+    repeated_turn = (
+        len(memory) >= 3
+        and last_index == index
+        and all(entry[0] == index for entry in memory[-3:])
+        and 'turn' in self._action_names[index].lower())
+    if index != 0 and not repeated_turn:
+      # Only override standing still or repeated turning. Repeated forward
+      # movement is productive (and often the best strategy), so leave it.
+      return index, exploration_step, False
+    pattern = self._exploration_pattern
+    for offset in range(len(pattern)):
+      choice = pattern[(exploration_step + offset) % len(pattern)]
+      if choice != index:
+        return choice, exploration_step + offset + 1, True
+    return pattern[exploration_step % len(pattern)], exploration_step + 1, True
 
   def _finish_step(self, index: int, memory, reward: float,
-                   decision: Mapping[str, object]
-                   ) -> tuple[int, LLMAgentState]:
+                   decision: Mapping[str, object], *,
+                   total_reward: float,
+                   exploration_step: int) -> tuple[int, LLMAgentState]:
     """Appends the chosen action to memory and returns the new state."""
     memory = memory + ((index, self._action_names[index], 0.0),)
     memory = memory[-self._memory_length:]
@@ -532,12 +994,19 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     decision.setdefault('action', index)
     decision.setdefault('action_name', self._action_names[index])
     decision.setdefault('reward', reward)
-    return index, LLMAgentState(memory=memory, decision=decision)
+    decision.setdefault('total_reward', total_reward)
+    decision.setdefault('exploration', False)
+    return index, LLMAgentState(
+        memory=memory,
+        decision=decision,
+        total_reward=total_reward,
+        exploration_step=int(exploration_step))
 
-  def _step_chat(self, timestep: dm_env.TimeStep, memory, reward: float
-                 ) -> tuple[int, LLMAgentState]:
+  def _decide_chat(self, timestep: dm_env.TimeStep, memory,
+                   total_reward: float) -> tuple[int, dict[str, object]]:
     """Free-form chat backend: asks for an `ACTION: <n>` line."""
-    user_prompt, images = self._build_user_prompt(timestep, memory=memory)
+    user_prompt, images = self._build_user_prompt(
+        timestep, memory=memory, total_reward=total_reward)
     messages: list[dict] = [
         {'role': 'system', 'content': self._system_prompt},
         {'role': 'user', 'content': user_prompt},
@@ -582,12 +1051,13 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
         'reasoning': reasoning,
         'note': note,
     }
-    return self._finish_step(index, memory, reward, decision)
+    return index, decision
 
-  def _step_decision(self, timestep: dm_env.TimeStep, memory, reward: float
-                     ) -> tuple[int, LLMAgentState]:
+  def _decide_decision(self, timestep: dm_env.TimeStep, memory,
+                       total_reward: float) -> tuple[int, dict[str, object]]:
     """Decision backend: scores the action list with `/v1/systemone`."""
-    state_text = self._build_decision_state(timestep, memory=memory)
+    state_text = self._build_decision_state(
+        timestep, memory=memory, total_reward=total_reward)
     questions = {
         'action': {
             'type': 'choice',
@@ -639,11 +1109,11 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
         'probabilities': probabilities,
         'usage': response.get('usage'),
     }
-    return self._finish_step(index, memory, reward, decision)
+    return index, decision
 
   def _build_user_prompt(self, timestep: dm_env.TimeStep, *,
-                         memory: Sequence[tuple[int, str, float]]
-                         ) -> tuple[str, list[str]]:
+                         memory: Sequence[tuple[int, str, float]],
+                         total_reward: float = 0.0) -> tuple[str, list[str]]:
     """Builds the per-step user prompt (and images, when vision is on)."""
     images = []
     if self._vision and 'RGB' in timestep.observation:
@@ -651,22 +1121,29 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
       if png is not None:
         images = [base64.b64encode(png).decode('utf-8')]
 
-    the_map, scalars, history = self._describe_observation(
-        timestep.observation, memory)
+    the_map, targets, scalars, history, progress = self._describe_observation(
+        timestep.observation, memory, total_reward)
     prompt = _USER_PROMPTS[self._prompt_language].format(
         map=the_map,
         map_legend=_bitmap_legend(),
+        targets=targets,
+        progress=progress,
         scalar_observations=scalars,
         history=history,
         max_action=self._num_actions - 1)
     return prompt, images
 
   def _build_decision_state(self, timestep: dm_env.TimeStep, *,
-                            memory: Sequence[tuple[int, str, float]]) -> str:
+                            memory: Sequence[tuple[int, str, float]],
+                            total_reward: float = 0.0) -> str:
     """Builds the `state` text used by decision models."""
-    the_map, scalars, history = self._describe_observation(
-        timestep.observation, memory)
+    the_map, targets, scalars, history, progress = self._describe_observation(
+        timestep.observation, memory, total_reward)
     parts = ['[Your local view]', the_map, '', _bitmap_legend()]
+    if targets:
+      parts += ['', targets]
+    if progress:
+      parts += ['', progress]
     if scalars:
       parts += ['', scalars]
     if history:
@@ -677,19 +1154,32 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
       self,
       observation: Mapping[str, np.ndarray],
       memory: Sequence[tuple[int, str, float]],
-  ) -> tuple[str, str, str]:
-    """Returns (map, scalar observations, history) text for one step."""
+      total_reward: float = 0.0,
+  ) -> tuple[str, str, str, str, str]:
+    """Returns (map, targets, scalars, history, progress) text for one step."""
     if 'RGB' in observation:
-      the_map = render_ascii_map(np.asarray(observation['RGB']),
-                                 cells=self._scene_cells)
-      scalar_lines = [
-          f'{name}: {float(np.asarray(value).squeeze()):+.2f}'
-          for name, value in observation.items()
-          if name != 'RGB' and np.asarray(value).size < 4
-      ]
+      rgb = np.asarray(observation['RGB'])
+      the_map = render_ascii_map(rgb, cells=self._scene_cells)
+      targets = _summarise_targets(
+          rgb, self._substrate_name, self._prompt_language,
+          self._action_names,
+          last_action_name=memory[-1][1] if memory else '')
+      scalar_lines = []
+      for name, value in observation.items():
+        if name == 'RGB':
+          continue
+        array = np.asarray(value).squeeze()
+        if array.size >= 4:
+          continue
+        if np.ndim(array) == 0:
+          scalar_lines.append(f'{name}: {float(array):+.2f}')
+        else:
+          scalar_lines.append(
+              f'{name}: {np.array2string(array, precision=2)}')
       scalars = '\n'.join(scalar_lines)
     else:
       the_map = '(no local RGB observation; rely on your memory)'
+      targets = ''
       scalars = '\n'.join(
           f'{name}: {np.asarray(value)}'
           for name, value in observation.items()
@@ -706,7 +1196,10 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
           lines='\n'.join(lines))
     else:
       history = ''
-    return the_map, scalars, history
+    progress = _progress_text(
+        total_reward, _zero_streak(memory), self._prompt_language,
+        stalled=_is_action_stall(memory))
+    return the_map, targets, scalars, history, progress
 
 
 def _game_note(substrate_name: str) -> str:
@@ -727,6 +1220,8 @@ def _build_system_prompt(*, persona: str, substrate_name: str,
       persona=persona,
       substrate=substrate_name,
       note=_game_note(substrate_name),
+      view_guide=_VIEW_GUIDES[prompt_language],
+      anti_stall=_ANTI_STALL_GUIDE[prompt_language],
       action_list=action_list,
       max_action=len(action_names) - 1)
 
@@ -738,6 +1233,8 @@ def _build_decision_instructions(*, persona: str,
       f'You are {persona}, an autonomous agent in the multi-agent gridworld '
       f'simulation "{substrate_name}".\n'
       f'The game: {_game_note(substrate_name)}\n\n'
+      f'{_VIEW_GUIDES["en"]}\n\n'
+      f'{_ANTI_STALL_GUIDE["en"]}\n\n'
       'Every option is one action you could take next; the option key is the '
       'action index and the description explains what it does. Choose the '
       'single action that best maximises the reward YOU receive over the '

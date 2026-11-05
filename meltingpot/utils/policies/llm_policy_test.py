@@ -340,5 +340,228 @@ class OllamaPolicyStepTest(parameterized.TestCase):
     self.assertIn('-0.50', prompt)
 
 
+class TargetSummaryTest(parameterized.TestCase):
+
+  def test_finds_apples_and_reports_direction(self):
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[8:16, 8:16, :] = (220, 60, 60)  # red apples, upper-left
+    summary = llm_policy._summarise_targets(rgb, 'commons_harvest__open')
+    self.assertIn('red apples', summary)
+    self.assertIn('ahead', summary)  # upper part of the view is ahead
+    self.assertIn('left', summary)   # and it is on the left
+    self.assertIn('cells away', summary)
+
+  def test_recommendation_includes_action_number(self):
+    names = ('do nothing (standing still)', 'step forward', 'step backward',
+             'sidestep left', 'sidestep right', 'turn left', 'turn right',
+             'fire a zap (attack the player ahead)')
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[8:16, 8:16, :] = (220, 60, 60)  # ahead-left
+    summary = llm_policy._summarise_targets(
+        rgb, 'commons_harvest__open', action_names=names)
+    self.assertIn('ACTION 5', summary)  # turn left
+
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[8:16, 36:52, :] = (220, 60, 60)  # ahead
+    summary = llm_policy._summarise_targets(
+        rgb, 'commons_harvest__open', action_names=names)
+    self.assertIn('ACTION 1', summary)  # step forward
+
+  def test_reports_missing_targets(self):
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    summary = llm_policy._summarise_targets(rgb, 'commons_harvest__open')
+    self.assertIn('not visible', summary)
+
+  def test_no_visible_target_recommends_scanning(self):
+    names = ('do nothing (standing still)', 'step forward', 'step backward',
+             'sidestep left', 'sidestep right', 'turn left', 'turn right',
+             'fire a zap (attack the player ahead)')
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    summary = llm_policy._summarise_targets(
+        rgb, 'commons_harvest__open', action_names=names)
+    self.assertIn('not visible', summary)
+    self.assertIn('ACTION 6', summary)  # turn right to scan
+
+  def test_clean_up_recommends_cleaning_when_river_is_ahead(self):
+    names = ('do nothing (standing still)', 'step forward', 'step backward',
+             'sidestep left', 'sidestep right', 'turn left', 'turn right',
+             'fire a zap (attack the player ahead)',
+             'fire a cleaning beam (clean polluted cells)')
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[:40, :, :] = (70, 110, 220)  # blue river in the upper (ahead) half
+    summary = llm_policy._summarise_targets(
+        rgb, 'clean_up', action_names=names)
+    self.assertIn('ACTION 8', summary)
+    self.assertIn('cleaning beam', summary)
+
+  def test_clean_up_turns_to_search_after_cleaning(self):
+    names = ('do nothing (standing still)', 'step forward', 'step backward',
+             'sidestep left', 'sidestep right', 'turn left', 'turn right',
+             'fire a zap (attack the player ahead)',
+             'fire a cleaning beam (clean polluted cells)')
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[:40, :, :] = (70, 110, 220)
+    summary = llm_policy._summarise_targets(
+        rgb, 'clean_up', action_names=names,
+        last_action_name='fire a cleaning beam (clean polluted cells)')
+    self.assertIn('You just cleaned the river', summary)
+    self.assertIn('ACTION 6', summary)  # turn right to search for apples
+
+  def test_generic_substrate_uses_notable_colours(self):
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[10:20, 10:20, :] = (240, 220, 80)  # yellow, upper-left
+    summary = llm_policy._summarise_targets(rgb, 'some_unknown_game')
+    self.assertIn('yellow objects', summary)
+
+  def test_small_vector_observations_are_formatted(self):
+    timestep = _mid_timestep()
+    observation = dict(timestep.observation)
+    observation['POSITION'] = np.array([1, 2])
+    observation['STAMINA'] = np.array([3, 4, 5])
+    timestep = timestep._replace(observation=observation)
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    prompt, _ = agent._build_user_prompt(timestep, memory=())
+    self.assertIn('POSITION', prompt)
+    self.assertIn('STAMINA', prompt)
+
+  def test_prompt_contains_targets_and_progress(self):
+    rgb = np.zeros((88, 88, 3), dtype=np.uint8)
+    rgb[8:16, 8:16, :] = (220, 60, 60)
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    prompt, _ = agent._build_user_prompt(
+        _mid_timestep(rgb=rgb), memory=(), total_reward=2.5)
+    self.assertIn('[Targets near you]', prompt)
+    self.assertIn('red apples', prompt)
+    self.assertIn('[Progress]', prompt)
+    self.assertIn('+2.50', prompt)
+
+
+class ProgressTextTest(parameterized.TestCase):
+
+  def test_progress_reports_total_and_streak(self):
+    text = llm_policy._progress_text(3.5, 0, 'en')
+    self.assertIn('+3.50', text)
+    self.assertIn('without reward: 0', text)
+
+  def test_progress_nudges_after_two_zero_reward_steps(self):
+    text = llm_policy._progress_text(0.0, 2, 'en', stalled=True)
+    self.assertIn('Change strategy', text)
+
+  def test_progress_keeps_going_while_moving(self):
+    text = llm_policy._progress_text(0.0, 3, 'en', stalled=False)
+    self.assertIn('Follow the recommended next action', text)
+    self.assertNotIn('Change strategy', text)
+
+  def test_action_stall_detects_repeats_and_noop(self):
+    self.assertFalse(llm_policy._is_action_stall(
+        ((2, 'turn right', 0.0), (2, 'turn right', 0.0))))
+    self.assertTrue(llm_policy._is_action_stall(
+        ((2, 'turn right', 0.0), (2, 'turn right', 0.0),
+         (2, 'turn right', 0.0))))
+    self.assertTrue(llm_policy._is_action_stall(
+        ((0, 'do nothing', 0.0), (0, 'do nothing', 0.0))))
+    self.assertFalse(llm_policy._is_action_stall(
+        ((1, 'step forward', 0.0), (1, 'step forward', 0.0))))
+    self.assertFalse(llm_policy._is_action_stall(
+        ((1, 'step forward', 0.0), (2, 'turn right', 0.0))))
+
+  def test_zero_streak_counts_from_the_end(self):
+    memory = ((1, 'step forward', 0.0), (2, 'turn right', 1.0),
+              (1, 'step forward', 0.0), (0, 'do nothing', 0.0))
+    self.assertEqual(llm_policy._zero_streak(memory), 2)
+
+
+class ExplorationTest(parameterized.TestCase):
+
+  def _stalled_state(self):
+    return llm_policy.LLMAgentState(
+        memory=((0, 'do nothing (standing still)', 0.0),
+                (0, 'do nothing (standing still)', 0.0)))
+
+  def test_stalled_noop_is_overridden_by_movement(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 0'))
+    action, state = agent.step(_mid_timestep(reward=0.0), self._stalled_state())
+    self.assertNotEqual(action, 0)
+    self.assertEqual(action, agent._exploration_pattern[0])
+    self.assertTrue(state.decision['exploration'])
+    self.assertIn('stalled: exploration override', state.decision['note'])
+
+  def test_repeated_forward_is_not_overridden(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    state = llm_policy.LLMAgentState(
+        memory=((1, 'step forward', 0.0), (1, 'step forward', 0.0)))
+    action, next_state = agent.step(_mid_timestep(reward=0.0), state)
+    self.assertEqual(action, 1)
+    self.assertFalse(next_state.decision['exploration'])
+
+  def test_two_turns_are_allowed_for_scanning(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 2'))
+    state = llm_policy.LLMAgentState(
+        memory=((2, 'turn right', 0.0), (2, 'turn right', 0.0)))
+    action, next_state = agent.step(_mid_timestep(reward=0.0), state)
+    self.assertEqual(action, 2)
+    self.assertFalse(next_state.decision['exploration'])
+
+  def test_three_repeated_turns_are_overridden(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 2'))
+    state = llm_policy.LLMAgentState(
+        memory=((2, 'turn right', 0.0), (2, 'turn right', 0.0),
+                (2, 'turn right', 0.0)))
+    action, next_state = agent.step(_mid_timestep(reward=0.0), state)
+    self.assertNotEqual(action, 2)
+    self.assertTrue(next_state.decision['exploration'])
+
+  def test_new_action_is_not_overridden(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    action, state = agent.step(_mid_timestep(reward=0.0), self._stalled_state())
+    self.assertEqual(action, 1)
+    self.assertFalse(state.decision['exploration'])
+
+  def test_reward_prevents_override(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 0'))
+    action, state = agent.step(_mid_timestep(reward=0.5), self._stalled_state())
+    self.assertEqual(action, 0)
+    self.assertFalse(state.decision['exploration'])
+    self.assertEqual(state.total_reward, 0.5)
+
+  def test_single_zero_step_does_not_trigger(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 0'))
+    prev = llm_policy.LLMAgentState(
+        memory=((0, 'do nothing (standing still)', 0.0),))
+    action, state = agent.step(_mid_timestep(reward=0.0), prev)
+    self.assertEqual(action, 0)
+    self.assertFalse(state.decision['exploration'])
+
+  def test_exploration_can_be_disabled(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 0'), exploration=False)
+    action, state = agent.step(_mid_timestep(reward=0.0), self._stalled_state())
+    self.assertEqual(action, 0)
+    self.assertFalse(state.decision['exploration'])
+
+  def test_decision_backend_is_also_explored(self):
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=mock.MagicMock(
+                        return_value=_decision_reply('0')))
+    action, state = agent.step(_mid_timestep(reward=0.0), self._stalled_state())
+    self.assertNotEqual(action, 0)
+    self.assertTrue(state.decision['exploration'])
+    self.assertEqual(state.decision['choice'], '0')  # model choice is logged
+
+  def test_total_reward_accumulates_across_steps(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    state = agent.initial_state()
+    _, state = agent.step(_first_timestep(), state)
+    _, state = agent.step(_mid_timestep(reward=0.5), state)
+    self.assertEqual(state.total_reward, 0.5)
+    _, state = agent.step(_mid_timestep(reward=1.0), state)
+    self.assertEqual(state.total_reward, 1.5)
+
+  def test_new_episode_resets_total_reward(self):
+    agent = _policy(mock.MagicMock(return_value='ACTION: 1'))
+    state = llm_policy.LLMAgentState(total_reward=9.0)
+    _, state = agent.step(_first_timestep(), state)
+    self.assertEqual(state.total_reward, 0.0)
+
+
 if __name__ == '__main__':
   absltest.main()

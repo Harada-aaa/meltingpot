@@ -118,8 +118,19 @@ Each step the policy builds a user message containing:
   the corresponding pixel block (not an average), so terrain and items stay
   recognisable;
 - a legend for the map characters;
+- a `[Targets near you]` summary that finds reward-relevant pixels at full
+  resolution (so small items such as apples survive the coarse map) and gives
+  the direction of the largest patch plus a concrete next action, e.g.
+  `recommended next action: ACTION 5 (turn left, then step forward)`;
+- a `[Progress]` line with cumulative reward and the number of steps since the
+  last reward;
 - small scalar observations (e.g. `READY_TO_SHOOT`, `COLLECTIVE_REWARD`);
 - the last `--memory` actions with the reward each one earned.
+
+The system message also explains the egocentric view: the bottom-centre
+sprite is the agent, the top of the map is straight ahead, and turning
+rotates the view. That is what lets the model translate "apples are
+ahead-left" into "turn left, then step forward".
 
 The system message describes the substrate (a curated note for common
 substrates, a generic note otherwise), the full action list derived from the
@@ -133,6 +144,13 @@ Replies are parsed defensively: reasoning-model `think` blocks are stripped,
 up to two attempts are made, and any transport/format failure falls back to
 the NOOP action (index 0) so an episode never halts. Every decision also
 records the raw reply and reasoning for the log.
+
+When an agent chooses NOOP or repeats a turn for `--stall_patience` steps
+without reward, the policy substitutes a short movement pattern (step
+forward, turns, sidesteps) so the agent keeps exploring instead of standing
+still. Repeated `step forward` is left alone, because walking straight is
+often the best way to reach a target. Disable the behaviour with
+`--noexplore`.
 
 ## Decision models (`tev1`, `nimble-v3`, ...)
 
@@ -197,6 +215,8 @@ Notes:
 | `--backend` | `auto` | `auto`, `chat`, or `decision` (`/v1/systemone`). |
 | `--base_url` | `http://localhost:11434` | Ollama server URL. |
 | `--temperature` | `0.3` | Sampling temperature. |
+| `--explore` | on | Break out of NOOP/repeated-turn stalls with movement. |
+| `--stall_patience` | `2` | Zero-reward steps before the exploration override. |
 | `--seed` | unset | Sampling seed (unset = varying runs). |
 | `--steps` | `40` | Episode length. |
 | `--memory` | `5` | Recent (action, reward) pairs in the prompt. |
@@ -227,6 +247,8 @@ With `--output_dir` set, one JSONL record per step is written:
       "backend": "decision",
       "latency_s": 0.42,
       "reward": 0.0,
+      "total_reward": 4.0,
+      "exploration": false,
       "note": null,
       "reasoning": null,
       "reply": "choice=1 confidence=0.87",
@@ -284,12 +306,17 @@ mapping when running scripted scenarios.
   text inside the environment. Communication is limited to what the
   environment exposes (movement, zaps, collective reward, ...). Use the
   per-agent `persona` to study heterogeneous behaviour instead.
-- Small local models (1-4B) work but often repeat one action. Increase
-  `--memory` or use a larger model for richer behaviour. Vision models can be
-  slow per step; start with 2 players.
-- The ASCII map is egocentric and does not mark which avatar is "you".
-  Substrates that expose symbolic observations (`POSITION`, `ORIENTATION`)
-  can be added to `_build_user_prompt` for stronger spatial reasoning.
+- Small local models (1-4B) work but often repeat one action. The exploration
+  override (`--explore`, default on) and the target summary keep them moving;
+  increase `--memory` or use a larger model for richer behaviour. Vision
+  models can be slow per step; start with 2 players.
+- The view guide assumes the usual Melting Pot avatar camera (the avatar near
+  the bottom centre, forward = up). Substrates with a different camera layout
+  may need the anchor in `_summarise_targets` adjusted.
+- Some substrates are intrinsically hard to score in a short episode:
+  `clean_up` with only two players barely keeps the river clean enough for
+  apples, and matrix games need coordination. Compare against a random
+  baseline before tuning prompts.
 - Latency is dominated by Ollama; each step performs one call per player.
 
 ## Tests
@@ -331,8 +358,12 @@ python examples/llm_agents/run_llm_simulation.py \
     --model=nimble-v3:9b
 ```
 
-- 各エージェントは毎ステップ、周囲のASCII色マップ・直近の行動と報酬・
-  行動一覧を受け取り、`ACTION: <番号>` の形式で行動を返します。
+- 各エージェントは毎ステップ、周囲のASCII色マップ・目標物の方向と
+  推奨行動・累計報酬・直近の行動と報酬・行動一覧を受け取り、
+  `ACTION: <番号>` の形式で行動を返します。
+- `--explore` (デフォルト有効) は、NOOPや同じ旋回の繰り返しで報酬が
+  得られないときに移動パターンへ差し替えて、立ち止まり続けるのを防ぎます。
+  `--noexplore` で無効化できます。
 - Ollamaが落ちている/応答が壊れている場合でも、NOOP(何もしない)に
   フォールバックしてシミュレーションを継続します。
 - ログは `--output_dir` 以下に `episode.jsonl` として保存され、

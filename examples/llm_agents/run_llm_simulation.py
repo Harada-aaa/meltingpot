@@ -77,6 +77,11 @@ flags.DEFINE_string("model", "llama3.2:3b", "Ollama model for the agents.")
 flags.DEFINE_enum("backend", "auto", ["auto", "chat", "decision"],
                   "Ollama API to use. 'auto' detects decision models such as "
                   "tev1 and nimble-v3 from their capabilities.")
+flags.DEFINE_bool("explore", True,
+                  "Replace repeated NOOP/turning choices with a movement "
+                  "pattern when an agent earns no reward for several steps.")
+flags.DEFINE_integer("stall_patience", 2,
+                     "Zero-reward steps before the exploration override.")
 flags.DEFINE_string("base_url", DEFAULT_BASE_URL, "Ollama server base URL.")
 flags.DEFINE_float("temperature", 0.3, "LLM sampling temperature.")
 flags.DEFINE_integer("seed", None,
@@ -194,13 +199,17 @@ def main(_):
         scene_cells=FLAGS.scene_cells,
         vision=FLAGS.vision,
         num_predict=FLAGS.num_predict,
-        backend=FLAGS.backend))
+        backend=FLAGS.backend,
+        exploration=FLAGS.explore,
+        stall_patience=FLAGS.stall_patience))
   states = [agent.initial_state() for agent in agents]
   logging.info("LLM backends: %s",
                ", ".join(f"P{player}={agent.backend}"
                          for player, agent in enumerate(agents)))
   if FLAGS.vision and any(agent.backend == "decision" for agent in agents):
     logging.warning("Decision models ignore --vision; no images are sent.")
+  logging.info("Exploration override: %s (stall_patience=%d)",
+               FLAGS.explore, FLAGS.stall_patience)
 
   log_file = None
   frames_dir = None
@@ -277,6 +286,8 @@ def main(_):
             "backend": decision.get("backend"),
             "latency_s": round(latency, 2),
             "reward": decision.get("reward"),
+            "total_reward": decision.get("total_reward"),
+            "exploration": decision.get("exploration"),
             "note": decision.get("note"),
             "reasoning": decision.get("reasoning"),
             "reply": decision.get("reply"),

@@ -152,12 +152,14 @@ python examples/llm_agents/run_llm_simulation.py \
     --model=llama3.2:3b
 ```
 
-Each agent receives an ASCII rendering of its local view plus a short memory
-of recent actions and rewards, and answers with a discrete action. Both chat
-models and Ollama **decision models** (`tev1`, `nimble-v3`) are supported; the
-runner detects the model's capabilities and switches to `/v1/systemone`
-automatically. Add `--gui` to watch the episode live in a pygame window (with
-an overlay of the latest actions and rewards), or see
+Each agent receives an ASCII rendering of its local view, the direction of
+nearby reward objects, a recommended next action, and a short memory of recent
+actions and rewards, then answers with a discrete action. Both chat models and
+Ollama **decision models** (`tev1`, `nimble-v3`) are supported; the runner
+detects the model's capabilities and switches to `/v1/systemone` automatically.
+An exploration override keeps agents moving when they would otherwise stand
+still. Add `--gui` to watch the episode live in a pygame window (with an
+overlay of the latest actions and rewards), or see
 [examples/llm_agents/README.md](examples/llm_agents/README.md) for all flags,
 logs, vision models, and how to combine LLM agents with scripted bots.
 
