@@ -47,6 +47,7 @@ import numpy as np  # noqa: E402
 from meltingpot import substrate  # noqa: E402
 from meltingpot.utils.policies import llm_policy  # noqa: E402
 from meltingpot.utils.policies.ollama_client import DEFAULT_BASE_URL  # noqa: E402
+from meltingpot.utils.visualization import pygame_viewer  # noqa: E402
 
 DEFAULT_SUBSTRATE = "commons_harvest__open"
 
@@ -73,6 +74,9 @@ flags.DEFINE_string("substrate", DEFAULT_SUBSTRATE, "Substrate to play.")
 flags.DEFINE_integer("players", None,
                      "Number of players; defaults to the substrate standard.")
 flags.DEFINE_string("model", "llama3.2:3b", "Ollama model for the agents.")
+flags.DEFINE_enum("backend", "auto", ["auto", "chat", "decision"],
+                  "Ollama API to use. 'auto' detects decision models such as "
+                  "tev1 and nimble-v3 from their capabilities.")
 flags.DEFINE_string("base_url", DEFAULT_BASE_URL, "Ollama server base URL.")
 flags.DEFINE_float("temperature", 0.3, "LLM sampling temperature.")
 flags.DEFINE_integer("seed", None,
@@ -91,6 +95,38 @@ flags.DEFINE_string("output_dir", "",
                     "Directory for JSONL logs; empty disables files.")
 flags.DEFINE_bool("save_frames", False,
                   "Save the global view as PNG images (requires OpenCV).")
+flags.DEFINE_bool("gui", False,
+                  "Show a live pygame window while the agents play.")
+flags.DEFINE_integer("fps", 8, "Maximum GUI refresh rate in frames/second.")
+flags.DEFINE_enum("gui_observation", "WORLD.RGB", ["WORLD.RGB", "RGB"],
+                  "Show the global world view, or the egocentric view of "
+                  "--gui_player.")
+flags.DEFINE_integer("gui_player", 0,
+                     "Player whose RGB view is displayed when "
+                     "--gui_observation=RGB.")
+
+
+def _overlay_lines(step_number, actions, rewards, totals, action_names):
+  """Builds the text overlay shown at the bottom of the GUI window."""
+  if actions:
+    entries = [f"P{player}:{action_names[action][:18]}"
+               for player, action in enumerate(actions)]
+    shown = " ".join(entries[:4])
+    if len(entries) > 4:
+      shown += f" +{len(entries) - 4} more"
+  else:
+    shown = "(waiting for the first decisions)"
+  if rewards is None:
+    reward_line = "step rewards: -"
+  else:
+    reward_line = "step rewards: " + " ".join(f"{reward:+.1f}"
+                                              for reward in rewards)
+  total_line = "totals: " + " ".join(f"{total:+.1f}" for total in totals)
+  return [
+      f"step {step_number} | {shown}",
+      f"{reward_line} | {total_line}",
+      "close the window or press ESC to stop",
+  ]
 
 
 def _ollama_models() -> tuple[str, ...]:
@@ -157,8 +193,14 @@ def main(_):
         memory_length=FLAGS.memory,
         scene_cells=FLAGS.scene_cells,
         vision=FLAGS.vision,
-        num_predict=FLAGS.num_predict))
+        num_predict=FLAGS.num_predict,
+        backend=FLAGS.backend))
   states = [agent.initial_state() for agent in agents]
+  logging.info("LLM backends: %s",
+               ", ".join(f"P{player}={agent.backend}"
+                         for player, agent in enumerate(agents)))
+  if FLAGS.vision and any(agent.backend == "decision" for agent in agents):
+    logging.warning("Decision models ignore --vision; no images are sent.")
 
   log_file = None
   frames_dir = None
@@ -177,9 +219,38 @@ def main(_):
 
   total_rewards = np.zeros(num_players)
   timestep = env.reset()
+
+  viewer = None
+  if FLAGS.gui:
+    try:
+      viewer = pygame_viewer.PygameViewer(
+          caption=f"Melting Pot: {substrate_name}", fps=FLAGS.fps)
+      logging.info("GUI window opened (close it or press ESC to stop).")
+    except RuntimeError as error:
+      logging.warning("--gui disabled: %s", error)
+
+  previous_actions = None
+  previous_rewards = None
   episode_log = []
   try:
     for step_number in range(FLAGS.steps):
+      if viewer is not None:
+        frame = (timestep.observation[FLAGS.gui_player]["RGB"]
+                 if FLAGS.gui_observation == "RGB"
+                 else timestep.observation[0]["WORLD.RGB"])
+        try:
+          keep_running = viewer.render(
+              frame,
+              _overlay_lines(step_number, previous_actions, previous_rewards,
+                             total_rewards, action_names))
+        except RuntimeError as error:
+          logging.warning("GUI failed (%s); continuing headless.", error)
+          viewer.close()
+          viewer = None
+        else:
+          if not keep_running:
+            logging.info("GUI window closed; stopping the episode.")
+            break
       if frames_dir is not None:
         _save_frame(timestep.observation[0]["WORLD.RGB"], frames_dir,
                     step_number)
@@ -203,11 +274,15 @@ def main(_):
             "player": player,
             "action": action,
             "action_name": action_names[action],
+            "backend": decision.get("backend"),
             "latency_s": round(latency, 2),
             "reward": decision.get("reward"),
             "note": decision.get("note"),
             "reasoning": decision.get("reasoning"),
             "reply": decision.get("reply"),
+            "choice": decision.get("choice"),
+            "confidence": decision.get("confidence"),
+            "probabilities": decision.get("probabilities"),
             "user_prompt": decision.get("user_prompt"),
         })
         logging.info("step %3d | player %d -> %-3d %s%s", step_number, player,
@@ -217,6 +292,8 @@ def main(_):
       timestep = env.step(actions)
       rewards = [float(reward) for reward in timestep.reward]
       total_rewards += np.asarray(rewards)
+      previous_actions = actions
+      previous_rewards = rewards
       step_log["rewards_per_player"] = [round(reward, 4) for reward in rewards]
       episode_log.append(step_log)
       if log_file is not None:
@@ -225,6 +302,8 @@ def main(_):
       if timestep.step_type.last():
         break
   finally:
+    if viewer is not None:
+      viewer.close()
     if log_file is not None:
       log_file.close()
     for agent in agents:

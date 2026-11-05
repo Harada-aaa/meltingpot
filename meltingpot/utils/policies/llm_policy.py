@@ -408,7 +408,10 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
                vision: bool = False,
                num_predict: int = 128,
                request_timeout: float = DEFAULT_TIMEOUT,
-               chat_fn=None):
+               backend: str = 'auto',
+               chat_fn=None,
+               decision_fn=None,
+               capabilities_fn=None):
     """Builds an LLM agent policy.
 
     Args:
@@ -427,8 +430,15 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
         models.
       num_predict: Maximum tokens generated per decision.
       request_timeout: Per-request timeout in seconds.
+      backend: "auto" (default), "chat", or "decision". Decision models
+        such as "tev1" and "nimble-v3" are detected automatically through
+        Ollama's model capabilities and scored with `/v1/systemone`.
       chat_fn: Optional standalone replacement of `ollama_client.chat`
         provided for testing only.
+      decision_fn: Optional standalone replacement of
+        `ollama_client.system_one` provided for testing only.
+      capabilities_fn: Optional standalone replacement of
+        `ollama_client.get_capabilities` provided for testing only.
     """
     if prompt_language not in _PROMPT_LANGUAGES:
       raise ValueError(
@@ -443,6 +453,8 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     self._num_predict = num_predict
     self._request_timeout = request_timeout
     self._chat_fn = chat_fn or ollama_client.chat
+    self._decision_fn = decision_fn or ollama_client.system_one
+    capabilities_fn = capabilities_fn or ollama_client.get_capabilities
     self._action_names = tuple(action_names)
     self._num_actions = len(self._action_names)
     self._persona = persona
@@ -454,6 +466,31 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
         action_names=self._action_names,
         prompt_language=prompt_language)
 
+    if backend not in ('auto', 'chat', 'decision'):
+      raise ValueError(
+          f"backend {backend!r} must be 'auto', 'chat' or 'decision'")
+    if backend == 'auto':
+      try:
+        capabilities = capabilities_fn(
+            model, base_url=base_url,
+            timeout=min(10., request_timeout))
+      except ollama_client.OllamaError as error:
+        logger.warning(
+            'Could not read the capabilities of %s (%s); using chat.',
+            model, error)
+        backend = 'chat'
+      else:
+        backend = 'decision' if 'decision' in capabilities else 'chat'
+    self._backend = backend
+    if self._backend == 'decision' and self._vision:
+      logger.warning(
+          'Model %s is a decision model; vision input is not supported and '
+          'will be ignored.', model)
+    logger.info('Ollama model %s uses the %s backend.', model, self._backend)
+    self._decision_instructions = _build_decision_instructions(
+        persona=persona,
+        substrate_name=substrate_name)
+
   def initial_state(self) -> LLMAgentState:
     """Returns the empty memory state."""
     return LLMAgentState()
@@ -461,6 +498,11 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
   def close(self) -> None:
     """Frees nothing; the Ollama server is managed externally."""
     pass
+
+  @property
+  def backend(self) -> str:
+    """Returns 'chat' or 'decision'; the backend chosen at construction."""
+    return self._backend
 
   def step(self, timestep: dm_env.TimeStep,
            prev_state: LLMAgentState) -> tuple[int, LLMAgentState]:
@@ -476,6 +518,25 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
       # attach it to the newest memory entry before prompting the model.
       last_index, last_name, _ = memory[-1]
       memory = memory[:-1] + ((last_index, last_name, reward),)
+    if self._backend == 'decision':
+      return self._step_decision(timestep, memory, reward)
+    return self._step_chat(timestep, memory, reward)
+
+  def _finish_step(self, index: int, memory, reward: float,
+                   decision: Mapping[str, object]
+                   ) -> tuple[int, LLMAgentState]:
+    """Appends the chosen action to memory and returns the new state."""
+    memory = memory + ((index, self._action_names[index], 0.0),)
+    memory = memory[-self._memory_length:]
+    decision = dict(decision)
+    decision.setdefault('action', index)
+    decision.setdefault('action_name', self._action_names[index])
+    decision.setdefault('reward', reward)
+    return index, LLMAgentState(memory=memory, decision=decision)
+
+  def _step_chat(self, timestep: dm_env.TimeStep, memory, reward: float
+                 ) -> tuple[int, LLMAgentState]:
+    """Free-form chat backend: asks for an `ACTION: <n>` line."""
     user_prompt, images = self._build_user_prompt(timestep, memory=memory)
     messages: list[dict] = [
         {'role': 'system', 'content': self._system_prompt},
@@ -513,32 +574,111 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     else:
       index = int(parsed)
     reasoning = _reasoning(reply) if reply is not None else None
-    # The reward for this action is only known at the next timestep.
-    memory = (memory + ((index, self._action_names[index], 0.0),))
-    memory = memory[-self._memory_length:]
     decision = {
         'model': self._model,
+        'backend': 'chat',
         'user_prompt': user_prompt,
         'reply': reply,
-        'action': index,
-        'action_name': self._action_names[index],
         'reasoning': reasoning,
         'note': note,
-        'reward': float(np.asarray(timestep.reward).squeeze()),
     }
-    return index, LLMAgentState(memory=memory, decision=decision)
+    return self._finish_step(index, memory, reward, decision)
+
+  def _step_decision(self, timestep: dm_env.TimeStep, memory, reward: float
+                     ) -> tuple[int, LLMAgentState]:
+    """Decision backend: scores the action list with `/v1/systemone`."""
+    state_text = self._build_decision_state(timestep, memory=memory)
+    questions = {
+        'action': {
+            'type': 'choice',
+            'instructions': self._decision_instructions,
+            'criteria': {str(index): name
+                         for index, name in enumerate(self._action_names)},
+        },
+    }
+    note = None
+    response = {}
+    try:
+      response = self._decision_fn(
+          model=self._model,
+          state=state_text,
+          questions=questions,
+          base_url=self._base_url,
+          timeout=self._request_timeout)
+    except ollama_client.OllamaError as error:
+      note = f'ollama_error: {error}'
+      logger.warning('%s (falling back to NOOP)', note)
+
+    answer = {}
+    answers = response.get('answers') if isinstance(response, Mapping) else None
+    if isinstance(answers, Mapping):
+      candidate = answers.get('action')
+      if isinstance(candidate, Mapping):
+        answer = candidate
+    choice = answer.get('choice')
+    try:
+      index = int(choice)
+    except (TypeError, ValueError):
+      index = None
+    if index is None or not 0 <= index < self._num_actions:
+      note = note or f'invalid decision choice {choice!r}; used NOOP fallback'
+      index = 0
+
+    probabilities = answer.get('probabilities')
+    confidence = answer.get('confidence')
+    decision = {
+        'model': self._model,
+        'backend': 'decision',
+        'user_prompt': state_text,
+        'reply': (f'choice={choice} confidence={confidence}'
+                  if choice is not None else None),
+        'reasoning': None,
+        'note': note,
+        'choice': choice,
+        'confidence': confidence,
+        'probabilities': probabilities,
+        'usage': response.get('usage'),
+    }
+    return self._finish_step(index, memory, reward, decision)
 
   def _build_user_prompt(self, timestep: dm_env.TimeStep, *,
                          memory: Sequence[tuple[int, str, float]]
                          ) -> tuple[str, list[str]]:
     """Builds the per-step user prompt (and images, when vision is on)."""
-    observation = timestep.observation
     images = []
-    if self._vision and 'RGB' in observation:
-      png = _encode_png(observation['RGB'])
+    if self._vision and 'RGB' in timestep.observation:
+      png = _encode_png(timestep.observation['RGB'])
       if png is not None:
         images = [base64.b64encode(png).decode('utf-8')]
 
+    the_map, scalars, history = self._describe_observation(
+        timestep.observation, memory)
+    prompt = _USER_PROMPTS[self._prompt_language].format(
+        map=the_map,
+        map_legend=_bitmap_legend(),
+        scalar_observations=scalars,
+        history=history,
+        max_action=self._num_actions - 1)
+    return prompt, images
+
+  def _build_decision_state(self, timestep: dm_env.TimeStep, *,
+                            memory: Sequence[tuple[int, str, float]]) -> str:
+    """Builds the `state` text used by decision models."""
+    the_map, scalars, history = self._describe_observation(
+        timestep.observation, memory)
+    parts = ['[Your local view]', the_map, '', _bitmap_legend()]
+    if scalars:
+      parts += ['', scalars]
+    if history:
+      parts += ['', history]
+    return '\n'.join(parts)
+
+  def _describe_observation(
+      self,
+      observation: Mapping[str, np.ndarray],
+      memory: Sequence[tuple[int, str, float]],
+  ) -> tuple[str, str, str]:
+    """Returns (map, scalar observations, history) text for one step."""
     if 'RGB' in observation:
       the_map = render_ascii_map(np.asarray(observation['RGB']),
                                  cells=self._scene_cells)
@@ -551,7 +691,8 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     else:
       the_map = '(no local RGB observation; rely on your memory)'
       scalars = '\n'.join(
-          f'{name}: {np.asarray(value)}' for name, value in observation.items()
+          f'{name}: {np.asarray(value)}'
+          for name, value in observation.items()
           if np.asarray(value).size < 4)
 
     if memory:
@@ -559,19 +700,21 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
       length = len(memory)
       for ordinal, (index, name, reward) in enumerate(memory):
         lines.append(_HISTORY_LINES[self._prompt_language].format(
-            steps_ago=length - ordinal, index=index, name=name, reward=reward))
+            steps_ago=length - ordinal, index=index, name=name,
+            reward=reward))
       history = _HISTORY_HEADERS[self._prompt_language].format(
           lines='\n'.join(lines))
     else:
       history = ''
+    return the_map, scalars, history
 
-    prompt = _USER_PROMPTS[self._prompt_language].format(
-        map=the_map,
-        map_legend=_bitmap_legend(),
-        scalar_observations=scalars,
-        history=history,
-        max_action=self._num_actions - 1)
-    return prompt, images
+
+def _game_note(substrate_name: str) -> str:
+  """Returns a short gameplay description for the substrate."""
+  for key, value in _SUBSTRATE_NOTES.items():
+    if substrate_name.startswith(key):
+      return value
+  return _GENERIC_NOTE
 
 
 def _build_system_prompt(*, persona: str, substrate_name: str,
@@ -580,14 +723,23 @@ def _build_system_prompt(*, persona: str, substrate_name: str,
   """Builds the system message describing the agent, world, and actions."""
   action_list = '\n'.join(
       f'{index}: {name}' for index, name in enumerate(action_names))
-  note = _GENERIC_NOTE
-  for key, value in _SUBSTRATE_NOTES.items():
-    if substrate_name.startswith(key):
-      note = value
-      break
   return _SYSTEM_PROMPTS[prompt_language].format(
       persona=persona,
       substrate=substrate_name,
-      note=note,
+      note=_game_note(substrate_name),
       action_list=action_list,
       max_action=len(action_names) - 1)
+
+
+def _build_decision_instructions(*, persona: str,
+                                 substrate_name: str) -> str:
+  """Builds the `instructions` text for a decision-model choice question."""
+  return (
+      f'You are {persona}, an autonomous agent in the multi-agent gridworld '
+      f'simulation "{substrate_name}".\n'
+      f'The game: {_game_note(substrate_name)}\n\n'
+      'Every option is one action you could take next; the option key is the '
+      'action index and the description explains what it does. Choose the '
+      'single action that best maximises the reward YOU receive over the '
+      'episode.'
+  )

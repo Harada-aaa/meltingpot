@@ -47,6 +47,96 @@ def list_models(base_url: str = DEFAULT_BASE_URL,
   return tuple(model.get('name', '') for model in payload.get('models', ()))
 
 
+def _post_json(url: str, payload: Mapping[str, object],
+               timeout: float) -> Mapping[str, object]:
+  """POSTs a JSON payload and returns the decoded JSON response."""
+  request = urllib.request.Request(
+      url=url,
+      data=json.dumps(payload).encode('utf-8'),
+      headers={'Content-Type': 'application/json'})
+  try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+      data = json.loads(response.read().decode('utf-8'))
+  except urllib.error.HTTPError as error:
+    detail = error.read().decode('utf-8', errors='replace')[:500]
+    raise OllamaError(
+        f'Ollama request to {url} failed: HTTP {error.code}: {detail}'
+    ) from error
+  except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+    raise OllamaError(f'Ollama request to {url} failed: {error}') from error
+  if not isinstance(data, Mapping):
+    raise OllamaError(f'Ollama returned an unexpected payload from {url}.')
+  return data
+
+
+def get_capabilities(model: str,
+                     *,
+                     base_url: str = DEFAULT_BASE_URL,
+                     timeout: float = 10.) -> tuple[str, ...]:
+  """Returns the capabilities Ollama reports for a model.
+
+  The list is empty for servers or models that do not report capabilities.
+  Decision models such as "tev1" and "nimble-v3" advertise "decision".
+
+  Args:
+    model: The Ollama model name.
+    base_url: Base URL of the Ollama server.
+    timeout: Request timeout in seconds.
+
+  Raises:
+    OllamaError: if the server cannot be reached.
+  """
+  data = _post_json(f'{base_url.rstrip("/")}/api/show', {'model': model},
+                    timeout)
+  capabilities = data.get('capabilities', ())
+  if not isinstance(capabilities, (list, tuple)):
+    return ()
+  return tuple(str(capability) for capability in capabilities)
+
+
+def system_one(model: str,
+               state: str,
+               questions: Mapping[str, Mapping[str, object]],
+               *,
+               base_url: str = DEFAULT_BASE_URL,
+               keep_alive: str = '30m',
+               timeout: float = DEFAULT_TIMEOUT) -> Mapping[str, object]:
+  """Scores decision questions with Ollama's `/v1/systemone` endpoint.
+
+  This is the API used by decision models such as `tev1:4b` and
+  `nimble-v3:9b`. They do not support regular chat generation; instead the
+  model scores the supplied `choice`, `noul` or `score` questions against the
+  `state` text and returns probabilities.
+
+  Args:
+    model: The Ollama model name.
+    state: The evidence to judge (plain text for the simulations here).
+    questions: Between 1 and 64 named questions. For action selection this is
+      typically one `choice` question mapping action keys to descriptions.
+    base_url: Base URL of the Ollama server.
+    keep_alive: How long the model stays loaded between requests.
+    timeout: Request timeout in seconds.
+
+  Returns:
+    The decoded response, containing an `answers` mapping and `usage`.
+
+  Raises:
+    OllamaError: if the request fails or the reply has no answers.
+  """
+  payload = {
+      'model': model,
+      'state': state,
+      'questions': dict(questions),
+      'keep_alive': keep_alive,
+  }
+  data = _post_json(f'{base_url.rstrip("/")}/v1/systemone', payload, timeout)
+  if 'answers' not in data:
+    raise OllamaError(
+        f'Ollama decision reply for {model} contains no "answers": '
+        f'{list(data)[:5]}')
+  return data
+
+
 def chat(messages: Sequence[Mapping[str, str]],
          model: str,
          *,
@@ -89,22 +179,7 @@ def chat(messages: Sequence[Mapping[str, str]],
   if seed is not None:
     payload['options']['seed'] = seed
 
-  request = urllib.request.Request(
-      url=f'{base_url.rstrip("/")}/api/chat',
-      data=json.dumps(payload).encode('utf-8'),
-      headers={'Content-Type': 'application/json'})
-  try:
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-      data = json.loads(response.read().decode('utf-8'))
-  except urllib.error.HTTPError as error:
-    detail = error.read().decode('utf-8', errors='replace')[:500]
-    raise OllamaError(
-        f'Ollama chat request failed on {model}: HTTP {error.code}: {detail}'
-    ) from error
-  except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
-    raise OllamaError(f'Ollama chat request failed on {model}: {error}') \
-        from error
-
+  data = _post_json(f'{base_url.rstrip("/")}/api/chat', payload, timeout)
   message = data.get('message') or {}
   if not isinstance(message, Mapping):
     raise OllamaError(f'Ollama reply from {model} has an unexpected format.')

@@ -68,6 +68,7 @@ def _policy(chat_fn, **kwargs):
       action_names=_ACTION_NAMES,
       persona='tester',
       substrate_name='commons_harvest__open',
+      backend='chat',
       chat_fn=chat_fn)
   defaults.update(kwargs)
   return llm_policy.OllamaPolicy(**defaults)
@@ -152,6 +153,116 @@ class ParseActionTest(parameterized.TestCase):
   def test_no_more_than_first_match(self):
     self.assertEqual(
         llm_policy._parse_action('ACTION: 1 (do not pick 2 or 3)', 4), 1)
+
+
+class BackendSelectionTest(parameterized.TestCase):
+
+  def test_auto_detects_decision_models(self):
+    agent = _policy(
+        mock.MagicMock(), backend='auto',
+        capabilities_fn=lambda *a, **k: ('decision',))
+    self.assertEqual(agent.backend, 'decision')
+
+  def test_auto_detects_chat_models(self):
+    agent = _policy(
+        mock.MagicMock(), backend='auto',
+        capabilities_fn=lambda *a, **k: ('completion', 'tools'))
+    self.assertEqual(agent.backend, 'chat')
+
+  def test_auto_falls_back_to_chat_if_server_unreachable(self):
+    def failing_capabilities(*args, **kwargs):
+      del args, kwargs
+      raise ollama_client.OllamaError('server unreachable')
+    agent = _policy(mock.MagicMock(), backend='auto',
+                    capabilities_fn=failing_capabilities)
+    self.assertEqual(agent.backend, 'chat')
+
+  def test_explicit_backend_skips_detection(self):
+    capabilities = mock.MagicMock()
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    capabilities_fn=capabilities)
+    self.assertEqual(agent.backend, 'decision')
+    capabilities.assert_not_called()
+
+  def test_invalid_backend_is_rejected(self):
+    with self.assertRaises(ValueError):
+      _policy(mock.MagicMock(), backend='magic')
+
+
+def _decision_reply(choice='2', confidence=0.9):
+  return {
+      'model': 'test-model',
+      'answers': {
+          'action': {
+              'type': 'choice',
+              'choice': choice,
+              'probabilities': {'0': 0.02, '1': 0.05, '2': 0.9, '3': 0.03},
+              'confidence': confidence,
+          },
+      },
+      'usage': {'input_tokens': 100, 'output_tokens': 0},
+  }
+
+
+class DecisionBackendTest(parameterized.TestCase):
+
+  def test_choice_is_used_as_the_action(self):
+    decision_fn = mock.MagicMock(return_value=_decision_reply('2'))
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=decision_fn)
+    action, state = agent.step(_first_timestep(), agent.initial_state())
+    self.assertEqual(action, 2)
+    self.assertEqual(state.memory[-1], (2, 'turn right', 0.0))
+    self.assertEqual(state.decision['backend'], 'decision')
+    self.assertEqual(state.decision['choice'], '2')
+    self.assertAlmostEqual(state.decision['confidence'], 0.9)
+    self.assertIsNone(state.decision['note'])
+
+  def test_request_uses_choice_question(self):
+    decision_fn = mock.MagicMock(return_value=_decision_reply('1'))
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=decision_fn)
+    agent.step(_mid_timestep(), agent.initial_state())
+    kwargs = decision_fn.call_args.kwargs
+    self.assertIn('Your local view', kwargs['state'])
+    self.assertIn('Map legend', kwargs['state'])
+    question = kwargs['questions']['action']
+    self.assertEqual(question['type'], 'choice')
+    self.assertEqual(question['criteria']['3'],
+                     'fire a zap (attack the player ahead)')
+    self.assertIn('maximises the reward', question['instructions'])
+
+  def test_invalid_choice_falls_back_to_noop(self):
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=mock.MagicMock(
+                        return_value=_decision_reply('99')))
+    action, state = agent.step(_mid_timestep(), agent.initial_state())
+    self.assertEqual(action, 0)
+    self.assertIn('NOOP fallback', state.decision['note'])
+
+  def test_missing_choice_falls_back_to_noop(self):
+    reply = {'answers': {'action': {'type': 'choice'}}}
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=mock.MagicMock(return_value=reply))
+    action, _ = agent.step(_mid_timestep(), agent.initial_state())
+    self.assertEqual(action, 0)
+
+  def test_decision_error_falls_back_to_noop(self):
+    def failing_decision(*args, **kwargs):
+      del args, kwargs
+      raise ollama_client.OllamaError('endpoint missing')
+    agent = _policy(mock.MagicMock(), backend='decision',
+                    decision_fn=failing_decision)
+    action, state = agent.step(_mid_timestep(), agent.initial_state())
+    self.assertEqual(action, 0)
+    self.assertIn('ollama_error', state.decision['note'])
+
+  def test_decision_backend_does_not_send_images(self):
+    decision_fn = mock.MagicMock(return_value=_decision_reply('0'))
+    agent = _policy(mock.MagicMock(), backend='decision', vision=True,
+                    decision_fn=decision_fn)
+    agent.step(_mid_timestep(), agent.initial_state())
+    self.assertNotIn('images', str(decision_fn.call_args.kwargs))
 
 
 class OllamaPolicyStepTest(parameterized.TestCase):
