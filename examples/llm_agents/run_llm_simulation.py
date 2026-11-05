@@ -30,7 +30,6 @@ Usage (from the repository root, with Ollama serving e.g. llama3.2:3b):
       --model=llama3.2:3b
 """
 
-import dataclasses
 import json
 import os
 import random
@@ -88,7 +87,8 @@ flags.DEFINE_integer("num_predict", 128,
                      "Maximum tokens generated per agent decision.")
 flags.DEFINE_enum("prompt_language", "en", ["en", "ja"],
                   "Language the prompts are written in.")
-flags.DEFINE_string("log_dir", "", "Directory for logs; empty disables files.")
+flags.DEFINE_string("output_dir", "",
+                    "Directory for JSONL logs; empty disables files.")
 flags.DEFINE_bool("save_frames", False,
                   "Save the global view as PNG images (requires OpenCV).")
 
@@ -104,18 +104,30 @@ def _ollama_models() -> tuple[str, ...]:
 
 
 def _save_frame(frame: np.ndarray, directory: str, step: int):
-
+  """Saves the global RGB view as a PNG, if OpenCV is installed."""
+  try:
+    import cv2  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    logging.warning("--save_frames ignored: OpenCV (opencv-python) missing.")
+    return
+  filename = os.path.join(directory, f"frame_{step:05d}.png")
+  cv2.imwrite(filename, frame[:, :, ::-1])
 
 def main(_):
   substrate_name = FLAGS.substrate
   config = substrate.get_config(substrate_name)
-  num_players = FLAGS.players or len(config.default_player_roles)
+  max_players = len(config.default_player_roles)
+  num_players = FLAGS.players or max_players
+  if not 1 <= num_players <= max_players:
+    raise ValueError(
+        f"{substrate_name} supports between 1 and {max_players} players, "
+        f"but --players={num_players} was requested.")
   roles = list(config.default_player_roles)[:num_players]
 
   logging.set_verbosity(logging.INFO)
   logging.info("Ollama models available: %s",
                ", ".join(_ollama_models()) or "<none>")
-  logging.info("Substrate %s with %d LLM agents:", substrate_name,
+  logging.info("Substrate %s with %d LLM agents", substrate_name,
                num_players)
 
   episode_started = time.time()
@@ -149,16 +161,15 @@ def main(_):
   states = [agent.initial_state() for agent in agents]
 
   log_file = None
-  log_path = None
   frames_dir = None
-  if FLAGS.log_dir:
+  if FLAGS.output_dir:
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join(FLAGS.log_dir,
+    log_dir = os.path.join(FLAGS.output_dir,
                            f"{substrate_name}__{FLAGS.model.replace(':', '_')}"
                            f"__{stamp}")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "episode.jsonl")
-    log_file = open(log_path, "w", encoding="utf-8")
+    log_file = open(os.path.join(log_dir, "episode.jsonl"), "w",
+                    encoding="utf-8")
     if FLAGS.save_frames:
       frames_dir = os.path.join(log_dir, "frames")
       os.makedirs(frames_dir, exist_ok=True)
@@ -170,7 +181,7 @@ def main(_):
   try:
     for step_number in range(FLAGS.steps):
       if frames_dir is not None:
-        _save_frame(timestep.observation["WORLD.RGB"], frames_dir,
+        _save_frame(timestep.observation[0]["WORLD.RGB"], frames_dir,
                     step_number)
       actions = []
       step_log = {
@@ -221,7 +232,6 @@ def main(_):
 
   logging.info("Episode finished in %.1fs. Total reward per player: %s",
                time.time() - episode_started, total_rewards.tolist())
-  return episode_log
 
 
 if __name__ == "__main__":

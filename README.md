@@ -140,6 +140,23 @@ between players with `TAB`. There are other substrates available in the
 [human_players](https://github.com/google-deepmind/meltingpot/blob/main/meltingpot/human_players) directory. Some have multiple
 variants, which you select with the `--level_name` flag.
 
+### LLM agents with Ollama
+
+You can also run a substrate as a multi-agent simulation in which every
+player is driven by a large language model served by a local
+[Ollama](https://ollama.com) instance:
+
+```shell
+python examples/llm_agents/run_llm_simulation.py \
+    --substrate=commons_harvest__open --players=3 --steps=40 \
+    --model=llama3.2:3b
+```
+
+Each agent receives an ASCII rendering of its local view plus a short memory
+of recent actions and rewards, and answers with a discrete action. See
+[examples/llm_agents/README.md](examples/llm_agents/README.md) for flags,
+logs, vision models, and how to combine LLM agents with scripted bots.
+
 ## Documentation
 
 Full documentation is available [here](https://github.com/google-deepmind/meltingpot/blob/main/docs/index.md).

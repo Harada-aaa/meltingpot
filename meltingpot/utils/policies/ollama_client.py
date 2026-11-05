@@ -96,6 +96,11 @@ def chat(messages: Sequence[Mapping[str, str]],
   try:
     with urllib.request.urlopen(request, timeout=timeout) as response:
       data = json.loads(response.read().decode('utf-8'))
+  except urllib.error.HTTPError as error:
+    detail = error.read().decode('utf-8', errors='replace')[:500]
+    raise OllamaError(
+        f'Ollama chat request failed on {model}: HTTP {error.code}: {detail}'
+    ) from error
   except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
     raise OllamaError(f'Ollama chat request failed on {model}: {error}') \
         from error

@@ -32,6 +32,7 @@ import numpy as np
 from meltingpot.utils.policies import ollama_client
 from meltingpot.utils.policies import policy
 from meltingpot.utils.policies.ollama_client import DEFAULT_BASE_URL
+from meltingpot.utils.policies.ollama_client import DEFAULT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -225,9 +226,9 @@ _REFORMAT_PROMPTS = {
 
 _HISTORY_LINES = {
     'en': '- {steps_ago} step(s) ago you chose ACTION {index} ({name}); '
-          'reward that step: {reward:+.2f}.',
+          'reward received after it: {reward:+.2f}.',
     'ja': '- {steps_ago}ステップ前に ACTION {index} ({name}) を選択した. '
-          'その時の報酬: {reward:+.2f}.',
+          'その後もらった報酬: {reward:+.2f}.',
 }
 
 _HISTORY_HEADERS = {
@@ -235,9 +236,14 @@ _HISTORY_HEADERS = {
     'ja': '\n[直近の行動履歴]\n{lines}',
 }
 
-_THINK_SECTION = re.compile(r'</think>', re.DOTALL)
+_THINK_OPEN = '<' + 'think' + '>'
+_THINK_CLOSE = '</' + 'think' + '>'
+_THINK_SECTION = re.compile(
+    re.escape(_THINK_OPEN) + '.*?' + re.escape(_THINK_CLOSE),
+    re.DOTALL)
 _ACTION_LINE = re.compile(r'ACTION\s*[:：]\s*(\d+)', re.IGNORECASE)
 _SPARSE_INTEGER = re.compile(r'^\s*(\d+)\s*$')
+_LEADING_INTEGER = re.compile(r'^\s*(\d+)\b')
 
 
 def describe_action(action: Mapping[str, int]) -> str:
@@ -264,21 +270,40 @@ def describe_action_set(
   return tuple(describe_action(action) for action in action_set)
 
 
-def _nearest_palette_char(colour: np.ndarray) -> str:
-  """Returns the palette character closest to the given RGB colour."""
-  red, green, blue = float(colour[0]), float(colour[1]), float(colour[2])
-  best_char, best_distance = _MAP_PALETTE[0][0], None
-  for char, name, entry in _MAP_PALETTE:
-    del name
-    distance = ((entry[0] - red) ** 2 + (entry[1] - green) ** 2 +
-                (entry[2] - blue) ** 2)
-    if best_distance is None or distance < best_distance:
-      best_char, best_distance = char, distance
-  return best_char
+def _palette_indices(rgb: np.ndarray) -> np.ndarray:
+  """Maps every pixel to the index of the nearest palette colour."""
+  palette = np.array([entry[2] for entry in _MAP_PALETTE], dtype=np.float32)
+  pixels = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
+  distances = ((pixels[:, None, :] - palette[None, :, :]) ** 2).sum(axis=-1)
+  return distances.argmin(axis=-1).reshape(rgb.shape[0], rgb.shape[1])
+
+
+def _encode_png(rgb: np.ndarray) -> bytes | None:
+  """Encodes an RGB observation as PNG bytes for vision-capable models.
+
+  Ollama requires a valid image file (PNG/JPEG), not raw pixel bytes. OpenCV
+  is already a Melting Pot dependency, but if it is unavailable we simply
+  fall back to a text-only request instead of failing the episode.
+  """
+  try:
+    import cv2  # pylint: disable=import-outside-toplevel
+  except ImportError:  # pragma: no cover - OpenCV is a declared dependency.
+    logger.warning('Vision mode needs OpenCV; falling back to text only.')
+    return None
+  bgr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)[:, :, ::-1])
+  success, buffer = cv2.imencode('.png', bgr)
+  if not success:
+    logger.warning('Could not encode the RGB observation as PNG.')
+    return None
+  return buffer.tobytes()
 
 
 def render_ascii_map(rgb: np.ndarray, cells: int = 22) -> str:
   """Renders an RGB observation as a coarse colour-letter map.
+
+  Each output cell shows the most common palette colour in the corresponding
+  block of pixels, which keeps terrain and items recognisable instead of
+  blurring them together.
 
   Args:
     rgb: uint8 array of shape (height, width, 3).
@@ -291,14 +316,20 @@ def render_ascii_map(rgb: np.ndarray, cells: int = 22) -> str:
   cells = max(1, min(cells, height, width))
   row_block = max(1, height // cells)
   column_block = max(1, width // cells)
-  rgb = np.asarray(rgb, dtype=np.float32)[:row_block * cells,
-                                          :column_block * cells]
-  pooled = rgb.reshape(cells, row_block, cells, column_block, 3) \
-      .mean(axis=(1, 3))
+  cropped = np.asarray(rgb)[:row_block * cells, :column_block * cells]
+  indices = _palette_indices(cropped)
+  blocks = indices.reshape(cells, row_block, cells, column_block)
 
+  num_colours = len(_MAP_PALETTE)
+  chars = np.array([entry[0] for entry in _MAP_PALETTE])
   rows = []
-  for row in pooled:
-    rows.append(''.join(_nearest_palette_char(colour) for colour in row))
+  for row in range(cells):
+    row_chars = []
+    for column in range(cells):
+      counts = np.bincount(blocks[row, :, column, :].ravel(),
+                           minlength=num_colours)
+      row_chars.append(chars[int(counts.argmax())])
+    rows.append(''.join(row_chars))
   return '\n'.join(rows)
 
 
@@ -310,7 +341,8 @@ def _bitmap_legend() -> str:
 
 
 def _strip_thinking(text: str) -> str:
-  """Removes </think> sections produced by reasoning models."""
+  """Removes <think> sections from replies of
+  reasoning-style models."""
   return _THINK_SECTION.sub('', text)
 
 
@@ -321,7 +353,9 @@ def _parse_action(text: str, num_actions: int) -> int | None:
   if not match:
     lines = [line for line in text.strip().splitlines() if line.strip()]
     if lines:
-      match = _SPARSE_INTEGER.search(lines[-1])
+      last_line = lines[-1]
+      match = (_SPARSE_INTEGER.search(last_line) or
+               _LEADING_INTEGER.search(last_line))
   if not match:
     return None
   index = int(match.group(1))
@@ -435,7 +469,13 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     On any transport or format failure the agent falls back to the NOOP
     action (index 0) so a long multi-agent episode is never halted.
     """
+    reward = float(np.asarray(timestep.reward).squeeze())
     memory = (() if timestep.step_type.first() else prev_state.memory)
+    if memory:
+      # The reward in this timestep was earned by the previous action, so
+      # attach it to the newest memory entry before prompting the model.
+      last_index, last_name, _ = memory[-1]
+      memory = memory[:-1] + ((last_index, last_name, reward),)
     user_prompt, images = self._build_user_prompt(timestep, memory=memory)
     messages: list[dict] = [
         {'role': 'system', 'content': self._system_prompt},
@@ -473,8 +513,8 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     else:
       index = int(parsed)
     reasoning = _reasoning(reply) if reply is not None else None
-    memory = memory + ((index, self._action_names[index],
-                        float(np.asarray(timestep.reward).squeeze()),),)
+    # The reward for this action is only known at the next timestep.
+    memory = (memory + ((index, self._action_names[index], 0.0),))
     memory = memory[-self._memory_length:]
     decision = {
         'model': self._model,
@@ -495,9 +535,9 @@ class OllamaPolicy(policy.Policy[LLMAgentState]):
     observation = timestep.observation
     images = []
     if self._vision and 'RGB' in observation:
-      image_array = np.ascontiguousarray(
-          np.asarray(observation['RGB'], dtype=np.uint8))
-      images = [base64.b64encode(image_array).decode('utf-8')]
+      png = _encode_png(observation['RGB'])
+      if png is not None:
+        images = [base64.b64encode(png).decode('utf-8')]
 
     if 'RGB' in observation:
       the_map = render_ascii_map(np.asarray(observation['RGB']),
